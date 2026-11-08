@@ -578,10 +578,18 @@ class MainFrame(wx.Frame):
     _account: Optional[MyPlexAccount] = None
     _service: Optional[PlexService] = None
 
-    def __init__(self, config: ConfigStore, auth_manager: AuthManager) -> None:
+    def __init__(
+        self,
+        config: ConfigStore,
+        auth_manager: AuthManager,
+        on_restart_requested: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__(None, title="Plexible", size=(1200, 800))
         self._config = config
         self._auth = auth_manager
+        # Called when the user asks for a restart (language change). The caller
+        # relaunches Plexible once this window has fully closed.
+        self._on_restart_requested = on_restart_requested
         self._update_manager = UpdateManager(self, config, status_callback=self._set_status)
         self._service: Optional[PlexService] = None
         self._account: Optional[MyPlexAccount] = None
@@ -808,11 +816,23 @@ class MainFrame(wx.Frame):
         if i18n.resolve_language(code) == i18n.get_language():
             return
         # Menus and panels are built once, so the new language applies on restart.
-        # Show the notice in the chosen language: that is the one the user reads.
-        chosen = i18n.resolve_language(code)
-        catalog = i18n.load_catalog(chosen)
-        message = N_("Restart Plexible to apply the new language.")
-        wx.MessageBox(catalog.get(message, message), "Plexible", wx.ICON_INFORMATION | wx.OK, parent=self)
+        # Ask in the chosen language: that is the one the user reads.
+        catalog = i18n.load_catalog(i18n.resolve_language(code))
+
+        def in_new_language(message: str) -> str:
+            return catalog.get(message, message)
+
+        if self._on_restart_requested is None:
+            message = N_("The new language will apply the next time Plexible starts.")
+            wx.MessageBox(in_new_language(message), "Plexible", wx.ICON_INFORMATION | wx.OK, parent=self)
+            return
+        question = N_("Plexible needs to restart to use the new language. Restart now?")
+        answer = wx.MessageBox(in_new_language(question), "Plexible", wx.ICON_QUESTION | wx.YES_NO, parent=self)
+        if answer == wx.YES:
+            self._on_restart_requested()
+            self.Close()
+        else:
+            self._set_status(in_new_language(N_("The new language will apply the next time Plexible starts.")))
 
     def _handle_toggle_dark_mode(self, event: wx.CommandEvent) -> None:
         """Toggle between light and dark UI themes without affecting NVDA accessibility."""
