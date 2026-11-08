@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from plexapi.base import PlexObject
 from plexapi.collection import Collection
 from plexapi.exceptions import NotFound
-from plexapi.library import Folder, LibrarySection, MusicSection, Hub
+from plexapi.library import FirstCharacter, Folder, LibrarySection, MusicSection, Hub
 from plexapi.media import MediaPart
 from plexapi.myplex import MyPlexAccount, MyPlexResource
 from plexapi.playlist import Playlist
@@ -137,6 +137,12 @@ _RADIO_KEYWORDS: Dict[str, List[str]] = {
     "track_radio": ["track radio"],
 }
 
+# Hubs of these types list library media (e.g. "Recently added" albums), never
+# radio stations; station hubs have type "station" (or "playlist" for mixes).
+_MEDIA_HUB_TYPES = frozenset(
+    {"album", "artist", "track", "clip", "movie", "show", "season", "episode", "photo", "photoalbum", "collection"}
+)
+
 _RADIO_DISPLAY_NAMES: Dict[str, str] = {
     "library_radio": N_("Library Radio"),
     "time_travel_radio": N_("Time Travel Radio"),
@@ -153,6 +159,16 @@ _RADIO_DISPLAY_NAMES: Dict[str, str] = {
     "album_radio": N_("Album Radio"),
     "track_radio": N_("Track Radio"),
 }
+
+# Plex search type ids used by the letter (firstCharacter) endpoints.
+_MUSIC_LETTER_TYPE_IDS: Dict[str, int] = {"artists": 8, "albums": 9, "tracks": 10}
+# A letter can hold thousands of tracks. plexapi's default page of 100 turns that
+# into dozens of round trips, which takes tens of seconds on a remote server.
+_MUSIC_LETTER_PAGE_SIZE = 1000
+# Once one server address answers, better-ranked addresses get this long to
+# answer too before the working one is used.
+_CONNECT_GRACE_SECONDS = 1.0
+_CONNECT_PENDING = object()
 
 _MUSIC_CATEGORY_DEFINITIONS: Tuple[Tuple[str, str, str], ...] = (
     (
@@ -474,7 +490,7 @@ class PlexService:
         for attempt_idx in range(3):
             for label, kwargs in attempts:
                 try:
-                    server = self._call_with_supported_kwargs(resource.connect, **kwargs)
+                    server = self._connect_resource_quickly(resource, **kwargs)
                     print(f"[PlexService] Connected to {name} via {label} strategy.")
                     return server
                 except Exception as exc:
@@ -487,6 +503,78 @@ class PlexService:
         if last_exc:
             raise last_exc
         raise RuntimeError(_("Unable to connect to Plex resource '{name}'.", name=name))
+
+    def _connect_resource_quickly(
+        self,
+        resource: MyPlexResource,
+        *,
+        ssl: Optional[bool] = None,
+        timeout: int = 8,
+        locations: Optional[List[str]] = None,
+    ) -> PlexServer:
+        """Connect like MyPlexResource.connect(), without waiting on dead addresses.
+
+        plexapi tries every address at once but waits for all of them before
+        choosing. A server reached from outside its network lists a local
+        address that never answers, so startup sat on its full timeout (8 s)
+        although the remote address had answered in 0.4 s.
+        """
+        if not isinstance(resource, MyPlexResource):
+            return self._call_with_supported_kwargs(resource.connect, ssl=ssl, timeout=timeout, locations=locations)
+        urls = list(resource.preferred_connections(ssl=ssl, locations=locations))
+        if not urls:
+            raise NotFound(_("Unable to connect to resource: {name}", name=resource.name))
+        session = getattr(getattr(resource, "_server", None), "_session", None)
+        outcomes: List[object] = [_CONNECT_PENDING] * len(urls)
+        changed = threading.Condition()
+
+        def attempt(index: int, url: str) -> None:
+            try:
+                outcome: object = PlexServer(baseurl=url, token=resource.accessToken, session=session, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                outcome = exc
+            with changed:
+                outcomes[index] = outcome
+                changed.notify_all()
+
+        for index, url in enumerate(urls):
+            threading.Thread(target=attempt, args=(index, url), name="PlexConnect", daemon=True).start()
+
+        deadline = time.monotonic() + timeout + 5
+        first_success_at: Optional[float] = None
+        with changed:
+            while True:
+                now = time.monotonic()
+                if first_success_at is None and any(self._is_connection(o) for o in outcomes):
+                    first_success_at = now
+                grace_over = first_success_at is not None and now - first_success_at >= _CONNECT_GRACE_SECONDS
+                server = self._pick_connection(outcomes, grace_over)
+                if server is not None:
+                    return server
+                if all(o is not _CONNECT_PENDING for o in outcomes) or now >= deadline:
+                    break
+                wait_for = deadline - now
+                if first_success_at is not None:
+                    wait_for = min(wait_for, first_success_at + _CONNECT_GRACE_SECONDS - now)
+                changed.wait(timeout=max(0.01, wait_for))
+        failures = [o for o in outcomes if isinstance(o, BaseException)]
+        raise NotFound(_("Unable to connect to resource: {name}", name=resource.name)) from (failures[-1] if failures else None)
+
+    @staticmethod
+    def _is_connection(outcome: object) -> bool:
+        return outcome is not _CONNECT_PENDING and not isinstance(outcome, BaseException)
+
+    @classmethod
+    def _pick_connection(cls, outcomes: Sequence[object], grace_over: bool) -> Optional[PlexServer]:
+        """Best-ranked address that answered, or None while a better one may still answer."""
+        for outcome in outcomes:
+            if outcome is _CONNECT_PENDING:
+                if grace_over:
+                    continue
+                return None
+            if cls._is_connection(outcome):
+                return cast(PlexServer, outcome)
+        return None
 
     def ensure_server(self) -> PlexServer:
         if self._server:
@@ -811,7 +899,10 @@ class PlexService:
             )
 
             for character in characters:
-                key = getattr(character, "key", None)
+                character_key = getattr(character, "key", None)
+                # The server gives a bare letter ("A", "%23"); fetching it as is
+                # glued it to the port ("…:32400A") and every letter failed.
+                key = self._first_character_path(section, category, character_key) if character_key else None
                 if not key:
                     continue
                 raw_title = str(getattr(character, "title", "")) or "#"
@@ -841,18 +932,19 @@ class PlexService:
         if cached is not None:
             return cached
         if bucket.key == "__browse_all__":
-            items = list(
-                self._music_category_direct_items(bucket.section, bucket.category)
-            )
+            items = self._music_browse_all_items(bucket)
             if items:
                 self._music_alpha_items_cache[bucket.identifier] = items
             return items
         try:
-            items = list(bucket.section.fetchItems(bucket.key))
+            items = list(bucket.section.fetchItems(bucket.key, container_size=_MUSIC_LETTER_PAGE_SIZE))
         except Exception as exc:  # noqa: BLE001
             print(f"[MusicCategory] Unable to load items for bucket '{bucket.title}': {exc}")
             items = []
-        hydrated = [self._ensure_item_loaded(item) for item in items]
+        # The list items are enough for the tree (title, type, ratingKey); plexapi
+        # loads the details of the one item that gets selected. Reloading every
+        # item here cost one round trip each before the letter could open.
+        hydrated = list(items)
         if not hydrated:
             fallback_items = self._music_alpha_bucket_search(bucket)
             if fallback_items:
@@ -886,10 +978,14 @@ class PlexService:
                 except Exception as exc:  # noqa: BLE001
                     print(f"[Playlist] Unable to load playlist items via fetchItems: {exc}")
                     items = []
-        hydrated = [self._ensure_item_loaded(item) for item in items]
-        if hydrated:
-            self._playlist_items_cache[cache_key] = hydrated
-        return hydrated
+        # The listing already has what the tree shows (title, type, ratingKey) and
+        # the stream parts; to_playable() reloads the one item being played if
+        # anything is missing. Reloading every entry here took about 20 minutes
+        # on a 58,000-track smart playlist.
+        items = [item for item in items if item is not None]
+        if items:
+            self._playlist_items_cache[cache_key] = items
+        return items
 
     def _collection_items(self, collection: PlexObject) -> List[PlexObject]:
         if collection is None:
@@ -973,32 +1069,33 @@ class PlexService:
                 except Exception as fallback_exc:  # noqa: BLE001
                     print(f"[MusicCategory] Secondary search failed for bucket '{bucket.title}': {fallback_exc}")
                     results = []
-        hydrated = [self._ensure_item_loaded(item) for item in results]
-        return hydrated
+        return results
+
+    @staticmethod
+    def _first_character_path(
+        section: MusicSection, category: str, character_key: Optional[str] = None
+    ) -> Optional[str]:
+        """Server path of the letter list for ``category``, or of one letter's items."""
+        section_key = str(getattr(section, "key", "") or "").strip()
+        type_id = _MUSIC_LETTER_TYPE_IDS.get(category)
+        if not section_key or type_id is None:
+            return None
+        path = f"/library/sections/{section_key}/firstCharacter"
+        if character_key:
+            path = f"{path}/{character_key}"
+        # Plex ignores libtype= here and answers with artist letters. With type=
+        # alone it counts albums and tracks by artist, so a letter's size did not
+        # match the items it returns; sorting by title makes the two agree.
+        return f"{path}?type={type_id}&sort=titleSort"
 
     def _fetch_first_character_entries(self, section: MusicSection, category: str) -> List[PlexObject]:
-        if category == "artists":
-            try:
-                return list(section.firstCharacter() or [])
-            except Exception as exc:  # noqa: BLE001
-                print(f"[MusicCategory] Unable to load artist characters: {exc}")
-                return []
-        raw_key = getattr(section, "key", None)
-        key = str(raw_key or "").strip()
-        if not key:
-            return []
-        libtype_map = {"albums": "album", "tracks": "track"}
-        libtype = libtype_map.get(category)
-        if not libtype:
+        path = self._first_character_path(section, category)
+        if not path:
             return []
         try:
-            server = self.ensure_server()
-        except Exception:
-            return []
-        path = f"/library/sections/{key}/firstCharacter?libtype={libtype}"
-        try:
-            data = server.query(path)
-            return list(section.findItems(data) or [])
+            # cls=FirstCharacter: parsed generically, album and track letters came
+            # back as Tag objects without title or size, so every letter read "#".
+            return list(section.fetchItems(path, cls=FirstCharacter) or [])
         except Exception as exc:  # noqa: BLE001
             print(f"[MusicCategory] Unable to load {category} character buckets: {exc}")
             return []
@@ -1062,6 +1159,23 @@ class PlexService:
                     seen.add(identifier)
                     pairs.append((hub, item))
         return pairs
+
+    def _music_browse_all_items(self, bucket: MusicAlphaBucket) -> List[object]:
+        # "Browse All Songs (58148)" must list every item it announces. The
+        # 200-item lookup below is only a stand-in for when letters fail, and
+        # reusing it here silently cut the list after the first 200 titles.
+        try:
+            return list(
+                bucket.section.search(
+                    libtype=bucket.libtype,
+                    sort="titleSort:asc",
+                    container_size=_MUSIC_LETTER_PAGE_SIZE,
+                )
+                or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MusicCategory] Unable to browse all {bucket.category}: {exc}")
+            return list(self._music_category_direct_items(bucket.section, bucket.category))
 
     def _music_category_direct_items(self, section: MusicSection, category: str) -> List[object]:
         try:
@@ -1199,6 +1313,31 @@ class PlexService:
             normalized = "station"
         return fallback, normalized
 
+    @staticmethod
+    def _disable_auto_reload(item: object) -> None:
+        # plexapi reloads a partial object from the server whenever an empty
+        # attribute is read. Station entries have empty fields (no ratingKey,
+        # often no summary), cannot be reloaded (the server answers 404) and
+        # do not need it, so reading them must stay local.
+        if isinstance(item, PlexObject):
+            item._autoReload = False
+
+    @staticmethod
+    def _is_station_hub(hub: Optional[object]) -> bool:
+        if hub is None:
+            return True
+        hub_type = str(getattr(hub, "type", "") or "").lower()
+        return hub_type not in _MEDIA_HUB_TYPES
+
+    def _is_station_item(self, item: object) -> bool:
+        self._disable_auto_reload(item)
+        item_type = str(getattr(item, "type", "") or "").lower()
+        return item_type in {"playlist", "station"}
+
+    def _station_key(self, item: object) -> Optional[str]:
+        self._disable_auto_reload(item)
+        return getattr(item, "key", None) or getattr(item, "stationKey", None)
+
     def _radio_stations_for_section(self, section: MusicSection) -> List[MusicRadioStation]:
         cache_key = self._radio_cache_key(section)
         cached = self._radio_station_cache.get(cache_key)
@@ -1210,18 +1349,23 @@ class PlexService:
         except Exception as exc:  # noqa: BLE001
             print(f"[Radio] Unable to load hubs for section {getattr(section, 'title', 'Music')}: {exc}")
             hubs = []
+        # Station entries are used as-is: playback only needs their key, and
+        # reloading them one by one is what made this list take a minute.
         station_candidates: List[Tuple[Optional[PlexObject], PlexObject]] = []
         for hub in hubs:
+            # Music hubs also list thousands of albums and artists ("Recently
+            # added" alone can hold the whole library); those are not stations.
+            if not self._is_station_hub(hub):
+                continue
             try:
                 hub_items = list(hub.items())
             except Exception as exc:  # noqa: BLE001
                 print(f"[Radio] Unable to load hub items for {getattr(hub, 'title', 'Hub')}: {exc}")
                 continue
-            if not hub_items:
-                continue
             for item in hub_items:
-                item = self._ensure_item_loaded(item)
-                key = getattr(item, "key", None) or getattr(item, "stationKey", None)
+                if not self._is_station_item(item):
+                    continue
+                key = self._station_key(item)
                 if not key:
                     continue
                 station_candidates.append((hub, item))
@@ -1231,13 +1375,13 @@ class PlexService:
             print(f"[Radio] Unable to load station listings for {getattr(section, 'title', 'Music')}: {exc}")
             fallback_playlists = []
         for playlist in fallback_playlists:
-            playlist = self._ensure_item_loaded(playlist)
+            self._disable_auto_reload(playlist)
             key = getattr(playlist, "key", None)
             if not key:
                 continue
             station_candidates.append((None, playlist))
         for item in self._fetch_section_station_directory(section):
-            item = self._ensure_item_loaded(item)
+            self._disable_auto_reload(item)
             key = getattr(item, "key", None)
             if not key:
                 continue
@@ -1245,8 +1389,9 @@ class PlexService:
 
         if not station_candidates:
             for hub_ref, item in self._fetch_radio_hub_pairs(section):
-                item = self._ensure_item_loaded(item)
-                key = getattr(item, "key", None) or getattr(item, "stationKey", None)
+                if not self._is_station_hub(hub_ref) or not self._is_station_item(item):
+                    continue
+                key = self._station_key(item)
                 if not key:
                     continue
                 station_candidates.append((hub_ref, item))
@@ -1258,7 +1403,7 @@ class PlexService:
         for hub_ref, item in station_candidates:
             # Hub entries can expose the playable key as stationKey only; without it
             # the station would be built with key=None and fail at playback time.
-            key = getattr(item, "key", None) or getattr(item, "stationKey", None)
+            key = self._station_key(item)
             rating_key = getattr(item, "ratingKey", None)
             dedupe_key = str(rating_key or key or "")
             if not key or not dedupe_key or dedupe_key in seen_keys:
@@ -1335,11 +1480,11 @@ class PlexService:
             ("recent_radio", _("Recently Added Radio"), _("Focus on the newest music while mixing in related songs.")),
             ("shuffle_radio", _("Deep Shuffle Radio"), _("Go deep into the catalogue with an always-changing mix.")),
         ]
+        # No server queries here: these options are listed every time a music item
+        # is selected or starts playing, and sampling seed tracks for all three
+        # (a 200-track library search each) saturated large libraries until every
+        # other request, Stop included, timed out. The seed is picked on start.
         for mode, label, description in descriptors:
-            seed = self._pick_synthetic_seed_track(section, mode, sample_only=True)
-            if seed is None:
-                continue
-            rating_key = getattr(seed, "ratingKey", None)
             options.append(
                 RadioOption(
                     id=f"synthetic:{mode}:{section_id}",
@@ -1347,7 +1492,7 @@ class PlexService:
                     description=description,
                     category=_("Stations"),
                     action=f"{mode}",
-                    data={"section": section, "mode": mode, "seed_rating_key": rating_key},
+                    data={"section": section, "mode": mode, "seed_rating_key": None},
                 )
             )
         return options
@@ -1368,7 +1513,9 @@ class PlexService:
             except Exception:
                 seed = None
         if seed is None:
-            seed = self._pick_synthetic_seed_track(section, mode)
+            # Same sample the option listing used to pre-pick from; only the chosen
+            # seed is loaded in full (below), not every candidate track.
+            seed = self._pick_synthetic_seed_track(section, mode, sample_only=True)
         if not seed:
             raise RuntimeError(_("Unable to find music to start this radio."))
         seed = self._ensure_item_loaded(seed)
@@ -1783,7 +1930,7 @@ class PlexService:
         browser_url = fallback_url or direct_url
         if not stream_url:
             return None
-        resume_offset = int(getattr(candidate, "viewOffset", 0) or 0)
+        resume_offset = self._start_offset(candidate)
         return PlayableMedia(
             title=title,
             media_type=media_type,
@@ -1822,11 +1969,23 @@ class PlexService:
                     return playable
         return None
 
+    @staticmethod
+    def _start_offset(node: PlexObject) -> int:
+        """Where a fresh play of ``node`` starts, in milliseconds.
+
+        Movies and episodes resume where they were left. A music track starts
+        from the beginning: Stop records the position, so resuming it made
+        Stop then Play behave like Pause then Play.
+        """
+        if str(getattr(node, "type", "") or "").lower() == "track":
+            return 0
+        return int(getattr(node, "viewOffset", 0) or 0)
+
     def _derive_stream_urls(self, node: PlexObject) -> tuple[Optional[str], Optional[str]]:
         server = self.ensure_server()
         direct_url: Optional[str] = None
         fallback_url: Optional[str] = None
-        resume_offset = int(getattr(node, "viewOffset", 0) or 0)
+        resume_offset = self._start_offset(node)
 
         media = getattr(node, "media", None)
         if media:
@@ -2283,6 +2442,10 @@ class PlexService:
         tolerance = 1250
         confirm_deadline = time.time() + 8.0
         server_offset = 0
+        # Plex keeps no resume point for music tracks: viewOffset stays 0 however
+        # long we wait, so the loop below would hold Stop for the full deadline
+        # and the progress would be resent forever. One reload is enough there.
+        is_track = str(getattr(item, "type", "") or "").lower() == "track"
         while True:
             try:
                 item.reload()
@@ -2291,6 +2454,12 @@ class PlexService:
                 server_offset = 0
                 break
             server_offset = int(getattr(item, "viewOffset", 0) or 0)
+            if is_track:
+                # The server accepted the update above; for a track that is all
+                # the confirmation it will ever give.
+                if server_offset <= 0 and bounded_position > 0:
+                    server_offset = bounded_position
+                break
             target = max(0, bounded_position - tolerance)
             if (
                 bounded_position <= 0

@@ -294,6 +294,7 @@ MESSAGES = {
     "Unable to authenticate with Plex:\n{error}": "Impossible de s'authentifier auprès de Plex :\n{error}",
     "Unable to check for updates:\n{error}": "Impossible de rechercher des mises à jour :\n{error}",
     "Unable to connect to Plex resource '{name}'.": "Impossible de se connecter à la ressource Plex « {name} ».",
+    "Unable to connect to resource: {name}": "Impossible de se connecter à la ressource : {name}",
     "Unable to connect to the current Plex server: {error}": "Impossible de se connecter au serveur Plex actuel : {error}",
     "Unable to connect to the Plex server for this tag:\n{error}": "Impossible de se connecter au serveur Plex pour cette étiquette :\n{error}",
     "Unable to find music to start this radio.": "Impossible de trouver de la musique pour démarrer cette radio.",
@@ -378,7 +379,6 @@ MESSAGES = {
     "{title} Mix": "Mix {title}",
     "{title} radio": "Radio {title}",
     "{title} Radio": "Radio {title}",
-    "{type}: {title}": "{type} : {title}",
     "{volume}%": "{volume} %",
     "⏮ Prev": "⏮ Préc.",
 }
