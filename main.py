@@ -97,6 +97,7 @@ ensure_requirements_installed()
 
 import wx
 
+from plex_client import i18n
 from plex_client.auth import AuthManager
 from plex_client.config import ConfigStore
 from plex_client.ui.main_frame import MainFrame
@@ -104,6 +105,7 @@ from plex_client.ui.main_frame import MainFrame
 
 def main() -> int:
     config = ConfigStore()
+    i18n.set_language(config.get_language())
     auth_manager = AuthManager(config)
     app = wx.App()
     frame = MainFrame(config, auth_manager)
